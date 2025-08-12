@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ping Pong Ball — HoughCircles Tracker</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121821;
+      --ink: #e7eef5;
+      --muted: #9fb3c8;
+      --green: #22c55e;
+      --neon: #22d3ee
+    }
+
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: system-ui, Segoe UI, Roboto, Arial
+    }
+
+    header {
+      padding: 12px 16px;
+      background: var(--panel);
+      display: flex;
+      gap: 12px;
+      align-items: center
+    }
+
+    header h1 {
+      font-size: 16px;
+      margin: 0;
+      font-weight: 700
+    }
+
+    .sp {
+      flex: 1
+    }
+
+    main {
+      display: grid;
+      gap: 12px;
+      padding: 12px
+    }
+
+    @media(min-width:900px) {
+      main {
+        grid-template-columns: 340px 1fr
+      }
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid #1c2633;
+      border-radius: 12px;
+      padding: 12px
+    }
+
+    label {
+      font-size: 13px;
+      color: var(--muted)
+    }
+
+    button,
+    input {
+      appearance: none;
+      border: 1px solid #223041;
+      background: #0f141b;
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px
+    }
+
+    button.primary {
+      background: #34d399;
+      color: #052012;
+      border: none;
+      font-weight: 700
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px 10px;
+      align-items: center
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 8px
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      border-radius: 12px;
+      background: #000;
+      touch-action: none
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>Ping Pong Ball — Live Tracker (Hough)</h1>
+    <span class="sp"></span>
+    <button id="btnStart" class="primary">Start</button>
+    <button id="btnStop">Stop</button>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="kv">
+        <label>Ball diameter (px)</label><input id="ballPx" type="range" min="8" max="60" value="22">
+        <label>Blur (odd ksize)</label><input id="blurK" type="range" min="3" max="11" value="7">
+        <label>Canny High</label><input id="cannyH" type="range" min="60" max="220" value="120">
+        <label>Accumulator</label><input id="accThr" type="range" min="8" max="40" value="16">
+        <label>Run every Nth frame</label><input id="skip" type="range" min="1" max="3" value="1">
+        <label>Move start (px/s)</label><input id="moveHigh" type="range" min="60" max="1200" value="220">
+        <label>Move stop (px/s)</label><input id="moveLow" type="range" min="20" max="800" value="120">
+      </div>
+      <div class="row small">
+        <div>State: <span id="lblState">IDLE</span></div>
+        <div>FPS: <span id="lblFps">–</span></div>
+        <div>Pos: <span id="lblPos">–</span></div>
+        <button id="btnClear">Clear trail</button>
+      </div>
+      <div class="row small">How to tune: ① Set <b>Ball diameter</b> ≈ visible ball size. ② If it misses, raise
+        <b>Accumulator</b> slightly or adjust <b>Canny High</b>. Good, even light helps a lot.
+      </div>
+    </section>
+
+    <section class="card">
+      <!-- One canvas: video + overlays -->
+      <canvas id="view"></canvas>
+    </section>
+  </main>
+
+  <!-- Hidden video (frame source) -->
+  <video id="video" playsinline muted style="display:none"></video>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onCvLoad()"></script>
+  <script>
+    let cvReady = false;
+    function onCvLoad() { if (window.cv) { cv['onRuntimeInitialized'] = () => { cvReady = true; lblState.textContent = 'CV ready'; }; } }
+
+    /* DOM */
+    const view = document.getElementById('view'), ctx = view.getContext('2d', { willReadFrequently: true });
+    const video = document.getElementById('video');
+    const btnStart = document.getElementById('btnStart'), btnStop = document.getElementById('btnStop'), btnClear = document.getElementById('btnClear');
+    const ballPxEl = document.getElementById('ballPx'), blurK = document.getElementById('blurK');
+    const cannyH = document.getElementById('cannyH'), accThr = document.getElementById('accThr'), skip = document.getElementById('skip');
+    const moveHigh = document.getElementById('moveHigh'), moveLow = document.getElementById('moveLow');
+    const lblState = document.getElementById('lblState'), lblFps = document.getElementById('lblFps'), lblPos = document.getElementById('lblPos');
+
+    /* State */
+    let stream = null, running = false, raf = 0, tick = 0;
+    const procW = 400; let procH = 225; // processing size (keeps CPU low)
+    const work = document.createElement('canvas'); work.width = procW; work.height = procH;
+    const wctx = work.getContext('2d', { willReadFrequently: true });
+
+    let lastTick = performance.now(), fps = 0;
+    const TRAIL_MS = 3000, JITTER_PX = 2;
+    const trail = [];
+    const STATE = { SEARCHING: 0, LOCKED_STILL: 1, MOVING: 2 }; let state = STATE.SEARCHING;
+    let emaX = null, emaY = null, lastX = null, lastY = null, lastT = null, speedPx = 0;
+
+    /* Camera */
+    async function start() {
+      try {
+        if (!cvReady) { lblState.textContent = 'Loading CV…'; }
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        video.srcObject = stream; await video.play();
+        await new Promise(r => { if (video.videoWidth) r(); else video.onloadedmetadata = () => r(); });
+        resize();
+        // reset
+        state = STATE.SEARCHING; emaX = emaY = lastX = lastY = lastT = null; speedPx = 0; trail.length = 0; tick = 0;
+        running = true; loop();
+      } catch (e) { lblState.textContent = 'Camera error: ' + (e?.message || e); }
+    }
+    function stop() {
+      running = false; cancelAnimationFrame(raf);
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      lblState.textContent = 'Stopped';
+    }
+    function resize() {
+      const vw = video.videoWidth || 1280, vh = video.videoHeight || 720, ratio = vw / vh;
+      const W = Math.max(640, Math.min(window.innerWidth - 40, 1280));
+      view.width = W; view.height = Math.round(W / ratio);
+      procH = Math.round(procW / ratio); work.width = procW; work.height = procH;
+    }
+    window.addEventListener('resize', () => { if (video.videoWidth) resize(); });
+
+    /* Detection: pure HoughCircles */
+    function detectCircle() {
+      // draw frame to processing canvas
+      wctx.drawImage(video, 0, 0, procW, procH);
+      const img = wctx.getImageData(0, 0, procW, procH);
+      const src = cv.matFromImageData(img);
+      const gray = new cv.Mat(); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+      // blur (odd ksize)
+      let k = Number(blurK.value) | 0; if (k % 2 === 0) k += 1;
+      cv.GaussianBlur(gray, gray, new cv.Size(k, k), 1.2, 1.2);
+
+      const circles = new cv.Mat();
+      const dp = 1.2;
+      const expD = Number(ballPxEl.value); // expected diameter @ processing resolution
+      const minR = Math.max(3, Math.round(expD * 0.5 * 0.7));
+      const maxR = Math.round(expD * 0.5 * 1.5);
+      const minDist = Math.max(8, Math.round(minR * 2));
+      const p1 = Number(cannyH.value);   // high threshold for Canny
+      const p2 = Number(accThr.value);   // accumulator threshold
+
+      cv.HoughCircles(gray, circles, cv.HOUGH_GRADIENT, dp, minDist, p1, p2, minR, maxR);
+
+      let best = null;
+      if (!circles.empty()) {
+        const data = circles.data32F; // [x,y,r, x,y,r, ...]
+        // choose circle closest to previous position (if any), otherwise the largest
+        if (emaX != null) {
+          let bestD = 1e9, bi = -1;
+          const sx = view.width / procW, sy = view.height / procH;
+          for (let i = 0; i < data.length; i += 3) {
+            const cx = data[i] * sx, cy = data[i + 1] * sy;
+            const d = Math.hypot(cx - emaX, cy - emaY);
+            if (d < bestD) { bestD = d; bi = i; }
+          }
+          if (bi >= 0) best = { cx: data[bi], cy: data[bi + 1], r: data[bi + 2] };
+        } else {
+          // pick largest radius
+          let br = 0, bi = -1;
+          for (let i = 0; i < data.length; i += 3) { if (data[i + 2] > br) { br = data[i + 2]; bi = i; } }
+          if (bi >= 0) best = { cx: data[bi], cy: data[bi + 1], r: data[bi + 2] };
+        }
+      }
+
+      src.delete(); gray.delete(); circles.delete();
+      return best; // in processing coords
+    }
+
+    /* Drawing */
+    function drawBallGreen(cx, cy, r) {
+      ctx.save(); ctx.shadowColor = 'rgba(34,197,94,0.95)'; ctx.shadowBlur = 24;
+      ctx.lineWidth = 3; ctx.strokeStyle = 'var(--green)';
+      ctx.beginPath(); ctx.arc(cx, cy, Math.max(6, r), 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+    }
+    function drawNeonSegment(p0, p1, a) {
+      // glow
+      ctx.save(); ctx.shadowColor = 'rgba(34,211,238,0.95)'; ctx.shadowBlur = 18; ctx.lineCap = 'round';
+      ctx.lineWidth = 8; ctx.strokeStyle = `rgba(34,211,238,${0.35 * a})`;
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke(); ctx.restore();
+      // core
+      ctx.save(); ctx.lineCap = 'round'; ctx.lineWidth = 4; ctx.strokeStyle = `rgba(34,211,238,${a})`;
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke(); ctx.restore();
+    }
+    const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+    /* Main loop */
+    function loop() {
+      if (!running) return;
+      const now = performance.now(), dt = now - lastTick; lastTick = now;
+      const inst = 1000 / Math.max(1, dt); fps = fps * 0.9 + inst * 0.1; lblFps.textContent = fps.toFixed(0);
+
+      // always draw live video first
+      ctx.drawImage(video, 0, 0, view.width, view.height);
+
+      let det = null;
+      if ((tick++ % Number(skip.value)) === 0) {
+        try { det = detectCircle(); } catch (e) { /* keep UI alive */ }
+      }
+
+      if (det) {
+        // map to view
+        const sx = view.width / procW, sy = view.height / procH;
+        const X = det.cx * sx, Y = det.cy * sy, R = det.r * Math.max(sx, sy);
+
+        // smooth center (EMA)
+        const s = 0.6;
+        emaX = (emaX == null) ? X : s * X + (1 - s) * emaX;
+        emaY = (emaY == null) ? Y : s * Y + (1 - s) * emaY;
+
+        // speed with jitter deadband
+        if (lastX != null && lastT != null) {
+          const dpx = Math.hypot(emaX - lastX, emaY - lastY);
+          const dts = (now - lastT) / 1000;
+          const dpxFilt = dpx < JITTER_PX ? 0 : dpx;
+          const spd = dts > 0 ? dpxFilt / dts : 0;
+          speedPx = 0.7 * speedPx + 0.3 * spd;
+        }
+        lastX = emaX; lastY = emaY; lastT = now;
+
+        // state machine (LOCKED first, then MOVING with hysteresis)
+        if (state === STATE.SEARCHING) state = STATE.LOCKED_STILL;
+        const high = Number(moveHigh.value), low = Number(moveLow.value);
+        if (state === STATE.LOCKED_STILL && speedPx > high) { state = STATE.MOVING; }
+        else if (state === STATE.MOVING && speedPx < low) { state = STATE.LOCKED_STILL; trail.length = 0; }
+
+        // draw trajectory when moving
+        if (state === STATE.MOVING) {
+          trail.push({ x: emaX, y: emaY, t: now });
+          for (let i = 1; i < trail.length; i++) {
+            const p0 = trail[i - 1], p1 = trail[i];
+            const a = clamp(1 - (now - p1.t) / TRAIL_MS, 0, 1);
+            drawNeonSegment(p0, p1, a);
+          }
+          while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
+        } else {
+          trail.length = 0;
+        }
+
+        // always highlight ball
+        drawBallGreen(emaX, emaY, R);
+        lblPos.textContent = `${Math.round(emaX)}, ${Math.round(emaY)}`;
+        lblState.textContent = state === 0 ? 'SEARCHING' : (state === 1 ? 'LOCKED_STILL' : 'MOVING');
+      } else {
+        // searching (fade any leftover trail quickly)
+        const windowMs = 800;
+        for (let i = 1; i < trail.length; i++) {
+          const p0 = trail[i - 1], p1 = trail[i], a = clamp(1 - (now - p1.t) / windowMs, 0, 1);
+          drawNeonSegment(p0, p1, a * 0.5);
+        }
+        while (trail.length && now - trail[0].t > windowMs) trail.shift();
+        lblPos.textContent = '–';
+        lblState.textContent = 'SEARCHING';
+      }
+
+      raf = requestAnimationFrame(loop);
+    }
+
+    /* UI */
+    btnStart.onclick = start;
+    btnStop.onclick = stop;
+    btnClear.onclick = () => { trail.length = 0; };
+  </script>
+</body>
+
+</html>
